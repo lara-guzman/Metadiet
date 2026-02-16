@@ -1,5 +1,4 @@
 # Metadiet
-Data Availability: Fecal tnrL Metabarcoding Reliably Reconstructs Plant Intake and Reveals Multi-Omics Links to Gut Microbiota and Host Metabolism
 
 # Supplementary Data and Code
 
@@ -8,10 +7,12 @@ Data Availability: Fecal tnrL Metabarcoding Reliably Reconstructs Plant Intake a
 **Status:** Submitted to *Food & Function* **Authors:** 
 [Nubia Andrea Villota-Salazar1#*, Oscar J. Lara-Guzmán1,2#, Vanessa Corrales-Agudelo1,2, Diego A. Rivera1, O. Lucía Ortega1,3, Jelver A. Sierra1,3, Katalina Muñoz-Durango1,3, Juan S. Escobar1,3*
 
+# These authors contributed equally to this work. 
 1 Vidarium–Nutrition, Health, and Wellness Research Center, Grupo Empresarial Nutresa. Carrera 52 #2-38, 050023 Medellin, Colombia.
 2 Current address: School of Nutrition and Dietetics, Universidad de Antioquia, Calle 70 No. 52-21, 050010 Medellín, Colombia.
 3 Current address: Faculty of Medicine, Universidad de Antioquia, Carrera 51D #62-29, 050010 Medellin, Colombia.]  
-**Contact:** [* Corresponding authors:
+
+**Contact:** [* Corresponding author:
 Nubia Andrea Villota-Salazar, andreavillota172024@outlook.com]
 
 ---
