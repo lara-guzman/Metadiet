@@ -31,9 +31,9 @@ The core of this analysis focuses on the multi-omics integration of **plant inta
 │   ├── processed/           # CLR and Z-score transformed data
 │   └── metadata.csv         # Participant metadata (T1/T2, Groups)
 ├── scripts/
-│   ├── 01_preprocessing.R   # Normalization (CLR/Z-score) & Alpha/Beta diversity
-│   ├── 02_correlations.R    # Procrustes & sPLS covariation analysis
-│   ├── 03_diablo_main.R     # CORE SCRIPT: Multi-omics DIABLO integration
-│   └── 04_pairwise.R        # Pearson correlations & Biomarker validation
-├── results/                 # Output figures and tables
+│   ├── 1_preprocessing.R         # Normalization (CLR/Z-score) & Alpha/Beta diversity
+│   ├─────  1.1_correlations.R    # Procrustes & sPLS covariation analysis
+│   ├── 2_diablo_main.R           # CORE SCRIPT: Multi-omics DIABLO integration
+│   └─────  2.1_pairwise.R        # Pearson correlations & Biomarker validation
+├── results/                      # Output figures and tables
 └── README.md
