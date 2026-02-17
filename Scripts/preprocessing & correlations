@@ -1,0 +1,803 @@
+Title: "Fecal trnL Metabarcoding Reliably Reconstructs Plant Intake and Reveals Multi-Omics Links to Gut Microbiota and Host Metabolism"
+
+Authors: 
+N. Andrea Villota-Salazar¹*, 
+Oscar Javier Lara-Guzmán¹, 
+Juan S. Escobar-Restrepo¹*  
+
+¹Vidarium – Nutrition, Health and Wellness Research Center  
+2023–2026
+
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    code_folding: hide
+
+This script contains the analytical workflow used to integrate fecal trnL metabarcoding data, gut microbiota profiles, and untargeted plasma metabolomics data.
+
+Samples were obtained from a nutritional intervention study involving daily consumption of golden berry (Physalis peruviana) for three weeks (DOI: 10.1016/j.foodres.2022.111949). Biological samples were collected at baseline (no golden berry consumption) and after three weeks of daily intake.
+
+# ===============================
+# PART 1 – INITIAL SETUP
+# ===============================
+
+# Clean workspace
+rm(list = ls())
+
+# Set random seed for reproducibility
+set.seed(5600)
+
+# ===============================
+# Check required packages
+# ===============================
+
+required_packages <- c(
+  "tidyverse", "data.table", "readxl", "stringr", "reshape2",
+  "phyloseq", "microbiome", "microViz", "decontam", "ape", "vegan",
+  "zCompositions", "compositions", "propr",
+  "mixOmics", "factoextra", "ecodist", "NMF", "Maaslin2",
+  "BiodiversityR",
+  "ggplot2", "plotly", "cowplot", "RColorBrewer", "ggrepel",
+  "ggpmisc", "ggdendro"
+)
+
+missing_packages <- required_packages[
+  !(required_packages %in% installed.packages()[,"Package"])
+]
+
+if(length(missing_packages) > 0){
+  stop(paste("Missing packages:",
+             paste(missing_packages, collapse = ", ")))
+}
+
+# ===============================
+# Load required libraries
+# ===============================
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# ===============================
+# Session information
+# ===============================
+sessionInfo()
+
+# ===============================
+# PART 2 – UTILITY FUNCTIONS
+# ===============================
+
+# Coefficient of variation (CV%)
+cv <- function(x) {
+  abs(sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE)) * 100
+}
+
+# ===============================
+# Color palette
+# ===============================
+
+myPalette <- RColorBrewer::brewer.pal(12, "Paired")
+
+# ===============================
+# PART 3 – LOAD trnL DATA
+# ===============================
+
+# Import OTU table
+taxa_table <- read.delim(
+  here::here("data/trnL/assigned_sequences_UCH_Dic_analysis.csv"),
+  sep = ";",
+  row.names = 1
+)
+
+# Keep abundance columns only
+taxa_table <- taxa_table[, 6:ncol(taxa_table)]
+
+# Remove taxa with zero total counts
+taxa_table <- taxa_table %>%
+  dplyr::filter(rowSums(dplyr::across(where(is.numeric))) != 0)
+
+otus_m <- as.matrix(taxa_table)
+
+# Import metadata
+samples_table <- read.delim(
+  here::here("data/trnL/metadata_UCH.txt"),
+  sep = "\t",
+  row.names = 1
+)
+
+# Import taxonomy
+taxonomy_table <- read.delim(
+  here::here("data/trnL/Taxonomy_UCH.txt"),
+  sep = "\t",
+  row.names = 1
+)
+
+# Create phyloseq object
+diet <- phyloseq(
+  otu_table(otus_m, taxa_are_rows = TRUE),
+  tax_table(as.matrix(taxonomy_table)),
+  sample_data(samples_table)
+)
+
+# Basic sanity check
+nsamples(diet)
+ntaxa(diet)
+
+# ===============================
+# PART 4 – DECONTAMINATION
+# ===============================
+
+# Library size check
+df_diet <- as.data.frame(sample_data(diet))
+df_diet$LibrarySize <- sample_sums(diet)
+
+ggplot(df_diet, aes(x = reorder(rownames(df_diet), LibrarySize),
+                    y = LibrarySize,
+                    color = sample_type)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(x = "Samples", y = "Library size")
+
+contam_freq <- isContaminant(
+  diet,
+  method = "frequency",
+  conc = "DNA_concentration"
+)
+
+table(contam_freq$contaminant)
+
+diet_decontam_freq <- prune_taxa(
+  !contam_freq$contaminant,
+  diet
+)
+
+# ===============================
+# PART 5 – FILTER SAMPLES
+# ===============================
+
+# Remove controls
+diet_clean <- prune_samples(
+  sample_data(diet_decontam_freq)$sample_type == "sample",
+  diet_decontam_freq
+)
+
+# Remove taxa with zero counts
+diet_clean <- filter_taxa(
+  diet_clean,
+  function(x) sum(x) > 0,
+  prune = TRUE
+)
+
+# Check sequencing depth
+depths <- sample_sums(diet_clean)
+summary(depths)
+
+# Optional: retain samples > 10,000 reads
+diet_clean <- prune_samples(depths > 10000, diet_clean)
+
+nsamples(diet_clean)
+ntaxa(diet_clean)
+
+
+# ===============================
+# PART 6 – RAREFACTION
+# ===============================
+
+set.seed(5600)
+
+diet_rarefied <- rarefy_even_depth(
+  diet_clean,
+  sample.size = 3950,
+  rngseed = 5600,
+  replace = FALSE,
+  verbose = TRUE
+)
+
+# Remove taxa absent after rarefaction
+diet_rarefied <- filter_taxa(
+  diet_rarefied,
+  function(x) sum(x) > 0,
+  prune = TRUE
+)
+
+summary(sample_sums(diet_rarefied))
+
+# ===============================
+# PART 7 – CLR TRANSFORMATION
+# ===============================
+
+# Add pseudocount to avoid log(0)
+diet_rarefied_pseudo <- transform_sample_counts(
+  diet_rarefied,
+  function(x) x + 1
+)
+
+# CLR transformation
+diet_clr <- microbiome::transform(
+  diet_rarefied_pseudo,
+  "clr"
+)
+
+# ===============================
+# PART 8 – GUT MICROBIOTA
+# ===============================
+
+# Load data
+otu_mat <- read_excel(here::here("data/16S/uchuva_only.otus.xlsx"))
+tax_mat <- read_excel(here::here("data/16S/uchuva.taxonomy.xlsx"))
+samples_df <- read_excel(here::here("data/16S/uchuva_only.meta.xlsx"))
+
+# Define row names
+otu_mat <- tibble::column_to_rownames(otu_mat, var = "otu")
+tax_mat <- tibble::column_to_rownames(tax_mat, var = "otu")
+samples_df <- tibble::column_to_rownames(samples_df, var = "sample")
+
+# Convert to matrices
+otu_mat <- as.matrix(otu_mat)
+tax_mat <- as.matrix(tax_mat)
+
+# Create phyloseq object
+goldberry <- phyloseq(
+  otu_table(otu_mat, taxa_are_rows = TRUE),
+  tax_table(tax_mat),
+  sample_data(samples_df)
+)
+
+nsamples(goldberry)
+ntaxa(goldberry)
+
+sample_data(goldberry)$is.neg <- sample_data(goldberry)$sample_type == "control"
+
+contam_prev_16S <- isContaminant(
+  goldberry,
+  method = "prevalence",
+  neg = "is.neg"
+)
+
+table(contam_prev_16S$contaminant)
+
+# Remove contaminant taxa
+goldberry_noncontam <- prune_taxa(
+  !contam_prev_16S$contaminant,
+  goldberry
+)
+
+# Remove controls
+goldberry_noncontam <- prune_samples(
+  sample_data(goldberry_noncontam)$sample_type != "control",
+  goldberry_noncontam
+)
+
+set.seed(5600)
+
+goldberry_rarefied <- rarefy_even_depth(
+  goldberry_noncontam,
+  sample.size = 1457,
+  replace = FALSE,
+  verbose = TRUE
+)
+
+summary(sample_sums(goldberry_rarefied))
+
+# Add pseudocount
+goldberry_pseudo <- transform_sample_counts(
+  goldberry_rarefied,
+  function(x) x + 1
+)
+
+goldberry_clr <- microbiome::transform(
+  goldberry_pseudo,
+  "clr"
+)
+
+===============================
+PART 9 – EMPIRICAL SENSITIVITY ASSESSMENT (trnL)
+===============================
+
+# This section evaluates the empirical lower detectable CLR abundance 
+# using the positive control (mock community) samples included in the trnL run.
+# This is NOT a formal limit of quantification (LOQ), since CLR values 
+# depend on the compositional structure of each sample.
+# Instead, we estimate the minimum observed CLR value among expected taxa
+# in the mock community after full preprocessing.
+
+# -------------------------------
+# 9.1 Identify positive controls
+# -------------------------------
+
+# Extract positive control samples after full preprocessing
+trnl_pos_controls <- prune_samples(
+  sample_data(diet_clr)$sample_type %in% c("CPOS.trnl", "CP"),
+  diet_clr
+)
+
+sample_names(trnl_pos_controls)
+
+# -------------------------------
+# 9.2 Define expected taxa in mock
+# -------------------------------
+
+# Mock community taxa (as defined in experimental design)
+mock_expected_taxa <- c(
+  "Otu002","Otu018","Otu023","Otu027","Otu033",
+  "Otu040","Otu042","Otu051","Otu056","Otu060",
+  "Otu078","Otu080","Otu082","Otu088","Otu089",
+  "Otu094","Otu100"
+)
+
+# Retain only expected taxa
+mock_expected_clr <- prune_taxa(
+  taxa_names(trnl_pos_controls) %in% mock_expected_taxa,
+  trnl_pos_controls
+)
+
+ntaxa(mock_expected_clr)
+
+# -------------------------------
+# 9.3 Empirical minimum detectable CLR abundance
+# -------------------------------
+
+# Extract CLR abundance matrix
+mock_clr_matrix <- as.matrix(otu_table(mock_expected_clr))
+
+# Compute empirical minimum detected CLR value
+min_detectable_clr_mock <- min(mock_clr_matrix, na.rm = TRUE)
+
+min_detectable_clr_mock
+
+# ===============================
+# PART 10 – PLASMA METABOLOME
+# ===============================
+
+# Load identified metabolites
+plasma_met <- read.delim(
+  file = here::here("data/metabolomics/DB_metabolomics_TENTATIVE_ID_uchuva.csv"),
+  header = TRUE,
+  sep = ";",
+  row.names = 1
+)
+
+# Remove non-quantitative columns
+plasma_met$Status <- NULL
+
+# Order samples alphabetically
+plasma_met <- plasma_met[order(rownames(plasma_met)),]
+
+dim(plasma_met)
+
+# -------------------------------
+# 11.1 Define treatment vector
+# -------------------------------
+
+treatment <- rep(c("Baseline", "Chronic"), length.out = nsamples(diet_clr))
+
+# -------------------------------
+# 11.2 Select samples used in integration analyses
+# -------------------------------
+
+sam_basic <- c(
+  "UCH.02.2b.trnl","UCH.02.2c.trnl.1","UCH.02.2c.trnl.2",
+  "UCH.03.3b","UCH.03.3c",
+  "UCH.04.4b.trnl","UCH.04.4c.trnl",
+  "UCH.05.5b","UCH.05.5c",
+  "UCH.07.7b.trnl","UCH.07.7c.trnl",
+  "UCH.08.8b","UCH.08.8c",
+  "UCH.09.9b.trnl.1","UCH.09.9b.trnl.2","UCH.09.9c.trnl",
+  "UCH.10.10b","UCH.10.10c",
+  "UCH.11.11b.trnl","UCH.11.11c.trnl",
+  "UCH.12.12b","UCH.12.12c",
+  "UCH.13.13b.trnl","UCH.13.13c.trnl",
+  "UCH.15.15b","UCH.15.15c",
+  "UCH.16.16b","UCH.16.16b.trnl","UCH.16.16c",
+  "UCH.17.17b","UCH.17.17c",
+  "UCH.18.18b.trnl","UCH.18.18c.trnl",
+  "UCH.19.19b","UCH.19.19c",
+  "UCH.20.T1b.trnl","UCH.20.T2c.trnl",
+  "UCH.21.21b","UCH.21.21c"
+)
+
+diet_subset <- prune_samples(
+  sample_names(diet_clr) %in% sam_basic,
+  diet_clr
+)
+
+# -------------------------------
+# 11.3 Apply empirical detection threshold
+# -------------------------------
+
+# Values below the empirically observed minimum detectable CLR abundance
+# in the mock community are set to zero.
+# This is used as a conservative sensitivity filtering step.
+
+threshold_zero <- function(x){
+  ifelse(x < min_detectable_clr_mock, 0, x)
+}
+
+diet_subset_clr_thresh <- transform_sample_counts(
+  diet_subset,
+  threshold_zero
+)
+
+# Remove taxa that become absent after thresholding
+diet_subset_clr_thresh <- filter_taxa(
+  diet_subset_clr_thresh,
+  function(x) sum(x > 0) > 0,
+  prune = TRUE
+)
+
+# -------------------------------
+# 11.4 Remove spike-in species
+# -------------------------------
+
+diet_subset_clr_thresh <- prune_taxa(
+  taxa_names(diet_subset_clr_thresh) != "Otu043",
+  diet_subset_clr_thresh
+)
+
+# -------------------------------
+# 11.5 Alpha diversity preparation
+# -------------------------------
+
+# Remove non-identified OTUs (retain curated set)
+otus_to_remove <- rownames(otu_table(diet_subset_clr_thresh))[
+  grep("^Otu[1-9][0-9]{2,}$", rownames(otu_table(diet_subset_clr_thresh)))
+]
+
+otus_to_remove <- setdiff(
+  otus_to_remove,
+  c("Otu100","Otu101","Otu102","Otu103")
+)
+
+diet_alpha_ready <- prune_taxa(
+  !(taxa_names(diet_subset_clr_thresh) %in% otus_to_remove),
+  diet_subset_clr_thresh
+)
+
+ntaxa(diet_alpha_ready)
+nsamples(diet_alpha_ready)
+
+===============================
+PART 12 – DIET ALPHA DIVERSITY
+===============================
+
+diet_richness <- diversityresult(
+  x = t(otu_table(diet_alpha_ready)),
+  index = "richness",
+  method = "each site"
+)
+
+diet_shannon <- diversityresult(
+  x = t(otu_table(diet_alpha_ready)),
+  index = "Shannon",
+  method = "each site"
+)
+
+diet_evenness <- diversityresult(
+  x = t(otu_table(diet_alpha_ready)),
+  index = "Jevenness",
+  method = "each site"
+)
+
+# Combine into single dataframe
+diet_alpha_df <- cbind(
+  diet_richness,
+  diet_shannon,
+  diet_evenness,
+  time = sample_data(diet_alpha_ready)$time,
+  id = sample_data(diet_alpha_ready)$id
+)
+
+summary(diet_alpha_df)
+
+samples_to_remove <- c(
+  "UCH.02.2c.trnl.2",
+  "UCH.09.9b.trnl.2",
+  "UCH.16.16b.trnl"
+)
+
+diet_alpha_ready_filtered <- prune_samples(
+  !(sample_names(diet_alpha_ready) %in% samples_to_remove),
+  diet_alpha_ready
+)
+
+diet_richness_filt <- diversityresult(
+  x = t(otu_table(diet_alpha_ready_filtered)),
+  index = "richness",
+  method = "each site"
+)
+
+diet_shannon_filt <- diversityresult(
+  x = t(otu_table(diet_alpha_ready_filtered)),
+  index = "Shannon",
+  method = "each site"
+)
+
+diet_evenness_filt <- diversityresult(
+  x = t(otu_table(diet_alpha_ready_filtered)),
+  index = "Jevenness",
+  method = "each site"
+)
+
+diet_alpha_df <- cbind(
+  diet_richness_filt,
+  diet_shannon_filt,
+  diet_evenness_filt,
+  time = sample_data(diet_alpha_ready_filtered)$time,
+  id = sample_data(diet_alpha_ready_filtered)$id
+)
+
+sd_richness <- sd(diet_alpha_df$richness, na.rm = TRUE)
+print(sd_richness)
+
+diet_alpha_df <- diet_alpha_df %>%
+  mutate(
+    id = ifelse(id == "UCH_20_BasalInter1", "UCH_20_Basal", id),
+    id = ifelse(id == "UCH_20_CronicoInter2", "UCH_20_Cronico", id)
+  )
+
+===============================
+PART 13 – CLR MATRICES FOR INTEGRATION
+===============================
+=
+13.1 Remover muestras duplicadas del CLR (sin threshold)
+
+samples_to_remove <- c(
+  "UCH.02.2c.trnl.2",
+  "UCH.09.9b.trnl.2",
+  "UCH.16.16b.trnl"
+)
+
+diet_clr_filtered <- prune_samples(
+  !(sample_names(diet_subset) %in% samples_to_remove),
+  diet_subset
+)
+
+13.2 Remover OTUs no identificadas
+
+otus_to_remove <- taxa_names(diet_clr_filtered)[
+  grepl("^Otu[1-9][0-9]{2,}$", taxa_names(diet_clr_filtered))
+]
+
+otus_to_remove <- setdiff(
+  otus_to_remove,
+  c("Otu100","Otu101","Otu102","Otu103")
+)
+
+diet_clr_filtered <- prune_taxa(
+  !(taxa_names(diet_clr_filtered) %in% otus_to_remove),
+  diet_clr_filtered
+)
+
+13.3 CLR con threshold
+
+diet_clr_thresh_filtered <- prune_samples(
+  !(sample_names(diet_subset_clr_thresh) %in% samples_to_remove),
+  diet_subset_clr_thresh
+)
+
+diet_clr_thresh_filtered <- prune_taxa(
+  !(taxa_names(diet_clr_thresh_filtered) %in% otus_to_remove),
+  diet_clr_thresh_filtered
+)
+
+===============================
+PART 14 – GUT MICROBIOTA PREPARATION
+===============================
+
+# -------------------------------
+# 14.1 Define clinical IDs used in integration
+# -------------------------------
+
+goldberry_basic <- c(
+  "UCH_02_Basal","UCH_02_Cronico",
+  "UCH_03_Basal","UCH_03_Cronico",
+  "UCH_04_Basal","UCH_04_Cronico",
+  "UCH_05_Basal","UCH_05_Cronico",
+  "UCH_07_Basal","UCH_07_Cronico",
+  "UCH_08_Basal","UCH_08_Cronico",
+  "UCH_09_Basal","UCH_09_Cronico",
+  "UCH_10_Basal","UCH_10_Cronico",
+  "UCH_11_Basal","UCH_11_Cronico",
+  "UCH_12_Basal","UCH_12_Cronico",
+  "UCH_13_Basal","UCH_13_Cronico",
+  "UCH_15_Basal","UCH_15_Cronico",
+  "UCH_16_Basal","UCH_16_Cronico",
+  "UCH_17_Basal","UCH_17_Cronico",
+  "UCH_18_Basal","UCH_18_Cronico",
+  "UCH_19_Basal","UCH_19_Cronico",
+  "UCH_20_Basal","UCH_20_Cronico",
+  "UCH_21_Basal","UCH_21_Cronico"
+)
+
+# -------------------------------
+# 14.2 Subset samples
+# -------------------------------
+
+goldberry_subset <- prune_samples(
+  sample_data(goldberry.rare)$id %in% goldberry_basic,
+  goldberry.rare
+)
+
+# Remove taxa absent after subsetting
+goldberry_subset <- filter_taxa(
+  goldberry_subset,
+  function(x) sum(x > 0) > 0,
+  prune = TRUE
+)
+
+# -------------------------------
+# 14.3 CLR transformation
+# -------------------------------
+
+goldberry_clr <- goldberry_subset %>%
+  tax_transform("clr")
+
+# -------------------------------
+# PART 15 – GUT MICROBIOTA ALPHA DIVERSITY
+# -------------------------------
+
+# Calculate diversity indexes using rarefied counts
+goldberry_richness <- diversityresult(
+  x = t(otu_table(goldberry_subset)),
+  index = "richness",
+  method = "each site"
+)
+
+summary(goldberry_richness)
+
+sd_richness_goldberry <- sd(goldberry_richness$richness, na.rm = TRUE)
+print(sd_richness_goldberry)
+
+goldberry_shannon <- diversityresult(
+  x = t(otu_table(goldberry_subset)),
+  index = "Shannon",
+  method = "each site"
+)
+
+goldberry_evenness <- diversityresult(
+  x = t(otu_table(goldberry_subset)),
+  index = "Jevenness",
+  method = "each site"
+)
+
+# Prepare alpha diversity dataframe
+goldberry_alpha_df <- cbind(
+  goldberry_richness,
+  goldberry_shannon,
+  goldberry_evenness,
+  id = sample_data(goldberry_subset)$id,
+  time = sample_data(goldberry_subset)$treatment
+)
+
+diet_alpha_df <- diet_alpha_df %>%
+  filter(id %in% common_ids) %>%
+  arrange(match(id, common_ids))
+
+goldberry_alpha_df <- goldberry_alpha_df %>%
+  filter(id %in% common_ids) %>%
+  arrange(match(id, common_ids))
+
+identical(diet_alpha_df$id, goldberry_alpha_df$id)
+
+
+# # ===============================
+# PART 16 – REPEATED-MEASURES CORRELATION (rmcorr)
+# ===============================
+
+# Prepare dataframe for rmcorr
+library(rmcorr)
+
+alphadiv_cocorr <- data.frame(
+  individual = goldberry_alpha_df$id,
+  rich_gut = goldberry_alpha_df$richness,
+  rich_diet = diet_alpha_df$richness,
+  time = goldberry_alpha_df$time
+)
+
+# Apply repeated-measures correlation
+rm_result <- rmcorr(
+  participant = "individual",
+  measure1    = "rich_gut",
+  measure2    = "rich_diet",
+  dataset     = alphadiv_cocorr
+)
+
+summary(rm_result)
+
+===============================
+PART 17 – DIET BETA DIVERSITY
+===============================
+diet_clr_thresh_dist <- dist_calc(
+  diet_clr_thresh_filtered,
+  dist = "euclidean"
+) %>%
+  dist_get()
+
+metadata_diet <- data.frame(
+  sample_data(diet_clr_thresh_filtered)
+)
+
+adonis2(
+  diet_clr_thresh_dist ~ time,
+  data = metadata_diet,
+  strata = metadata_diet$subject,
+  permutations = 4999
+)
+
+Homogeneity of dispersion 
+
+betadisper_test_diet <- betadisper(
+  diet_clr_thresh_dist,
+  metadata_diet$time
+)
+
+anova(betadisper_test_diet)
+
+
+===============================
+GUT MICROBIOTA – BETA DIVERSITY 
+===============================
+
+### Gut microbiota ----
+
+# Distance (Euclidean on CLR = Aitchison)
+goldberry_ait_dist <- dist_calc(
+  goldberry.rare2.clr,
+  dist = "euclidean"
+) %>%
+  dist_get()
+
+# Metadata
+metadata_microbiota <- data.frame(
+  sample_data(goldberry.rare2.clr)
+)
+
+# PERMANOVA simple
+adonis2(
+  goldberry_ait_dist ~ treatment,
+  data = metadata_microbiota,
+  permutations = 999
+)
+
+# PERMANOVA estratificado (longitudinal)
+adonis2(
+  goldberry_ait_dist ~ treatment,
+  data = metadata_microbiota,
+  strata = metadata_microbiota$individual,
+  permutations = 999
+)
+
+betadisper_micro <- betadisper(
+  goldberry_ait_dist,
+  metadata_microbiota$treatment
+)
+
+anova(betadisper_micro)
+
+===============================
+PROCRUSTES
+===============================
+
+### Plasma metabolome ----
+# Euclidean distances
+plasma_met_eucl <- vegdist(plasma_met, method = "euclidean", upper = FALSE, diag = FALSE)
+
+# Aitchison distances
+plasma_met.clr <- clr(plasma_met)
+plasma_met_ait <- vegdist(plasma_met.clr, method = "euclidean", upper = FALSE, diag = FALSE)
+
+### Diet-Metabolome ----
+protest(X = as.matrix(diet_clr_thresh_dist), Y = as.matrix(plasma_met_eucl), scores = "sites", permutations = 9999)
+
+### Microbiota-Metabolome ----
+protest(X = as.matrix(goldberry_ait_dist), Y = as.matrix(plasma_met_ait), scores = "sites", permutations = 9999)
+
+### Microbiota-Diet ----
+protest(X = as.matrix(goldberry_ait_dist), Y = as.matrix(diet_clr_thresh_dist), scores = "sites", permutations = 9999)
+
+
+
+
+
+
+
+
